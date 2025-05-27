@@ -1,15 +1,17 @@
 name: CI-CD
+
 on:
   push:
     branches: [main]
 
 permissions:
-  id-token: write  
+  id-token: write
   contents: read
   pull-requests: read
+  deployments: write
 
 env:
-  AWS_REGION: us-east-1
+  AWS_REGION: us-east-2
 
 jobs:
   build-push:
@@ -18,32 +20,44 @@ jobs:
       image: ${{ steps.meta.outputs.tags }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
+
       - run: npm ci && npm run build
-      - name: Configure AWS creds (least privilege)
+
+      - name: Configure AWS creds
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubOIDCDeploy
           aws-region: ${{ env.AWS_REGION }}
+
       - name: Login to ECR
         uses: aws-actions/amazon-ecr-login@v2
+
       - name: Meta
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/hello-world
+
       - name: Build & Push
         uses: docker/build-push-action@v5
         with:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
+
       - name: Trivy scan (registry)
-        uses: aquasecurity/trivy-action@v0.19.0
+        uses: aquasecurity/trivy-action@0.30.0
         with:
           image-ref: ${{ steps.meta.outputs.tags }}
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
 
   deploy-staging:
     needs: build-push
@@ -51,14 +65,23 @@ jobs:
     environment: staging
     steps:
       - uses: actions/checkout@v4
-      - uses: aws-actions/configure-aws-credentials@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Configure AWS creds
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubOIDCDeploy
           aws-region: ${{ env.AWS_REGION }}
+
       - name: CDK synth & deploy
         run: |
           npm i -g aws-cdk@2
           cd infra
+          npm ci
           cdk deploy Service-dev --require-approval never -c stage=dev
 
   promote-production:
@@ -66,17 +89,50 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: production
-      url: ${{ steps.lb.outputs.url }}
     concurrency: prod
     steps:
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Configure AWS creds
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubOIDCDeploy
           aws-region: ${{ env.AWS_REGION }}
+
       - name: Manual approval
-        uses: chrnorm/deployment-approval@v2
+        uses: chrnorm/deployment-action@v2.0.5
+        id: deployment
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          environment-url: http://my-app-url.com
+          environment: production
+
       - name: Deploy prod
         run: |
           npm i -g aws-cdk@2
           cd infra
+          npm ci
           cdk deploy Service-prod --require-approval never -c stage=prod
+
+      - name: Update deployment status (success)
+        if: success()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: '${{ github.token }}'
+          environment-url: ${{ steps.deployment.outputs.environment_url }}
+          deployment-id: ${{ steps.deployment.outputs.deployment_id }}
+          state: 'success'
+
+      - name: Update deployment status (failure)
+        if: failure()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: '${{ github.token }}'
+          environment-url: ${{ steps.deployment.outputs.environment_url }}
+          deployment-id: ${{ steps.deployment.outputs.deployment_id }}
+          state: 'failure'
