@@ -1,0 +1,82 @@
+name: CI-CD
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write  
+  contents: read
+  pull-requests: read
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci && npm run build
+      - name: Configure AWS creds (least privilege)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubOIDCDeploy
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/hello-world
+      - name: Build & Push
+        uses: docker/build-push-action@v5
+        with:
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+      - name: Trivy scan (registry)
+        uses: aquasecurity/trivy-action@v0.19.0
+        with:
+          image-ref: ${{ steps.meta.outputs.tags }}
+
+  deploy-staging:
+    needs: build-push
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubOIDCDeploy
+          aws-region: ${{ env.AWS_REGION }}
+      - name: CDK synth & deploy
+        run: |
+          npm i -g aws-cdk@2
+          cd infra
+          cdk deploy Service-dev --require-approval never -c stage=dev
+
+  promote-production:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ steps.lb.outputs.url }}
+    concurrency: prod
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubOIDCDeploy
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Manual approval
+        uses: chrnorm/deployment-approval@v2
+      - name: Deploy prod
+        run: |
+          npm i -g aws-cdk@2
+          cd infra
+          cdk deploy Service-prod --require-approval never -c stage=prod

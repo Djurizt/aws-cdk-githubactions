@@ -1,0 +1,32 @@
+name: PR Quality Gate
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  lint-test-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run lint   # eslint + ts‑eslint
+      - run: npm test       # jest
+      - name: Build image
+        run: docker build -t hello-world:pr .
+      - name: Trivy vuln scan
+        uses: aquasecurity/trivy-action@v0.19.0
+        with:
+          image-ref: hello-world:pr
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
