@@ -23,8 +23,9 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 20 
           cache: npm
+          cache-dependency-path: /app/package-lock.json
 
       - run: npm ci && npm run build
 
@@ -46,6 +47,7 @@ jobs:
       - name: Build & Push
         uses: docker/build-push-action@v5
         with:
+          context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
 
@@ -70,6 +72,7 @@ jobs:
         with:
           node-version: 20
           cache: npm
+          cache-dependency-path: /infra/package-lock.json
 
       - name: Configure AWS creds
         uses: aws-actions/configure-aws-credentials@v4
@@ -89,6 +92,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: production
+      url: ${{ steps.lb.outputs.url }}
     concurrency: prod
     steps:
       - uses: actions/checkout@v4
@@ -97,6 +101,8 @@ jobs:
         with:
           node-version: 20
           cache: npm
+          cache-dependency-path: /infra/package-lock.json
+          
 
       - name: Configure AWS creds
         uses: aws-actions/configure-aws-credentials@v4
@@ -109,30 +115,37 @@ jobs:
         id: deployment
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          environment-url: http://my-app-url.com
-          environment: production
 
       - name: Deploy prod
         run: |
           npm i -g aws-cdk@2
           cd infra
           npm ci
-          cdk deploy Service-prod --require-approval never -c stage=prod
+          cdk deploy --all --require-approval never -c stage=prod
 
-      - name: Update deployment status (success)
+      - name: Get LB URL
+        id: lb
+        run: |
+          URL=$(aws cloudformation describe-stacks \
+            --stack-name Service-prod \
+            --query "Stacks[0].Outputs[?OutputKey=='ServiceUrl'].OutputValue" \
+            --output text)
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Update deployment status
         if: success()
         uses: chrnorm/deployment-status@v2
         with:
-          token: '${{ github.token }}'
-          environment-url: ${{ steps.deployment.outputs.environment_url }}
-          deployment-id: ${{ steps.deployment.outputs.deployment_id }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          environment-url: ${{ steps.lb.outputs.url }}
+          deployment-id: ${{ github.deployment_id }}
           state: 'success'
 
       - name: Update deployment status (failure)
         if: failure()
         uses: chrnorm/deployment-status@v2
         with:
-          token: '${{ github.token }}'
-          environment-url: ${{ steps.deployment.outputs.environment_url }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          environment-url: ${{ steps.lb.outputs.url }}
           deployment-id: ${{ steps.deployment.outputs.deployment_id }}
           state: 'failure'
